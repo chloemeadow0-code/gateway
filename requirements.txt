@@ -1,4 +1,4 @@
-# MCP 网关核心
+# MCP Gateway Core
 mcp
 uvicorn
 python-dotenv
@@ -7,24 +7,24 @@ pydantic
 requests
 websockets
 
-# 数据库
+# Database
 supabase
 
 # LLM SDK
 openai
 
-# 向量记忆 (Mem0 + Pinecone 双写)
+# Vector Memory (Mem0 + Pinecone dual-write)
 mem0ai
-pinecone-client
+pinecone
 
-# 网页搜索
+# Web Search
 tavily-python
 duckduckgo-search
 
-# Google 集成 (Gmail / Calendar)
+# Google Integration (Gmail / Calendar)
 google-auth
 google-auth-httplib2
 google-api-python-client
 
-# 多媒体 (AI 音乐 / 翻唱，可选)
+# Multimedia (AI Music / Cover, optional)
 replicate
