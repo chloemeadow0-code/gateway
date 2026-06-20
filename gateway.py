@@ -66,11 +66,16 @@ class HostFixMiddleware:
             await self._handle_restart(send)
             return
 
-        # ---------- 其余请求：修正 Host 头后透传 ----------
-        headers = dict(scope.get("headers", []))
-        host = os.environ.get("GATEWAY_HOST", "localhost:8000").encode()
-        headers[b"host"] = host
-        scope["headers"] = list(headers.items())
+        # ---------- 其余请求：仅当显式配置 GATEWAY_HOST 时才修正 Host ----------
+        # 不再无条件把 Host 改成 localhost:8000，否则在反代/云平台后会导致
+        # MCP SSE 端点校验失败（mcp/server/sse.py: connect_sse 抛
+        # ValueError("Request validation failed")）。
+        host_override = os.environ.get("GATEWAY_HOST", "").strip()
+        if host_override:
+            # 只替换 host 这一个键，保留所有其他头及重复项（dict 转换会丢重复头）。
+            headers = [(k, v) for k, v in scope.get("headers", []) if k.lower() != b"host"]
+            headers.append((b"host", host_override.encode()))
+            scope["headers"] = headers
 
         await self.app(scope, receive, send)
 
