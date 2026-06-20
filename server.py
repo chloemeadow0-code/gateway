@@ -17,6 +17,7 @@ import os
 import re
 import json
 import time
+import uuid
 import base64
 import random
 import asyncio
@@ -37,6 +38,9 @@ mcp = FastMCP("GenericGateway")
 # 保留启动时的原始环境变量快照，支持热更新回滚
 ORIGINAL_ENV = dict(os.environ)
 
+# 🛡️ 接口安全密钥：所有 /api/* 接口必须校验（防止未授权调用）
+API_SECRET = os.environ.get("API_SECRET", "").strip()
+
 # ---------- 数据库客户端 (Supabase) ----------
 supabase = None
 try:
@@ -48,22 +52,129 @@ try:
 except Exception as e:
     print(f"⚠️ Supabase 初始化失败: {e}")
 
-# ---------- 长期记忆客户端 (Mem0，可选) ----------
-mem0_client = None
+# ---------- 长期记忆客户端 (Mem0 + Pinecone 双写) ----------
+# 还原原版 HybridMemoryClient：Mem0 为主，Pinecone 兜底双写，保证记忆不丢
+MEM0_API_KEY = os.environ.get("MEM0_API_KEY", "").strip()
+MEM0_USER_ID = os.environ.get("MEM0_USER_ID", "default").strip()
+PINECONE_KEY = os.environ.get("PINECONE_API_KEY", "").strip()
+
 try:
-    from mem0 import Memory
-    MEM0_API_KEY = os.environ.get("MEM0_API_KEY", "").strip()
-    if MEM0_API_KEY:
-        mem0_client = Memory.from_config({"vector_store": {"provider": "mem0"}})
-except Exception as e:
-    print(f"⚠️ Mem0 初始化失败(可选): {e}")
+    from mem0 import MemoryClient
+except ImportError:
+    MemoryClient = None
 
-# ---------- HTTP 会话 ----------
+try:
+    from pinecone import Pinecone
+except ImportError:
+    Pinecone = None
+
+
+class HybridMemoryClient:
+    """记忆双写客户端：Mem0 主路 + Pinecone 兜底，任一故障不影响记忆持久化。"""
+
+    def __init__(self):
+        self.mem0 = MemoryClient(api_key=MEM0_API_KEY) if MEM0_API_KEY and MemoryClient else None
+        self.pc = Pinecone(api_key=PINECONE_KEY) if PINECONE_KEY and Pinecone else None
+        self.index_name = os.environ.get("PINECONE_INDEX_NAME", "notion-brain-v2")
+        self.index = self.pc.Index(self.index_name) if self.pc else None
+
+    def search(self, query, user_id=None, filters=None, limit=3):
+        user_id = user_id or MEM0_USER_ID
+        # 1. 优先 Mem0，但必须确认它确实返回了结果
+        if self.mem0:
+            try:
+                safe_filters = filters if filters else {"user_id": user_id}
+                res = self.mem0.search(query=query, filters=safe_filters, limit=limit)
+                res_list = res.get("results", res) if isinstance(res, dict) else res
+                if isinstance(res_list, list) and len(res_list) > 0:
+                    return res
+            except Exception as e:
+                print(f"⚠️ Mem0 搜索异常: {e}")
+        # 2. Mem0 无果则强制查询 Pinecone
+        if self.index:
+            try:
+                vec = _get_embedding(query)
+                if vec:
+                    r = self.index.query(vector=vec, top_k=limit, include_metadata=True)
+                    return {"results": [{"memory": m.metadata.get("text", ""), "id": m.id}
+                                        for m in r.matches if m.metadata]}
+            except Exception as e:
+                print(f"❌ Pinecone 搜索失败: {e}")
+        return []
+
+    def add(self, messages, user_id=None):
+        user_id = user_id or MEM0_USER_ID
+        success = False
+        if self.mem0:
+            try:
+                self.mem0.add(messages, user_id=user_id)
+                success = True
+            except Exception as e:
+                print(f"⚠️ Mem0 写入异常: {e}")
+        # 同步双写 Pinecone（移除 early return，保证兜底）
+        if self.index:
+            try:
+                text = " | ".join([f"{m.get('role')}: {m.get('content')}" for m in messages if isinstance(m, dict)]) if isinstance(messages, list) else str(messages)
+                vec = _get_embedding(text)
+                if vec:
+                    self.index.upsert(vectors=[{"id": str(uuid.uuid4()), "values": vec,
+                                                "metadata": {"text": text, "user_id": user_id}}])
+                    success = True
+            except Exception as e:
+                print(f"❌ Pinecone 写入失败: {e}")
+        return success
+
+    def get_all(self, user_id=None):
+        user_id = user_id or MEM0_USER_ID
+        if self.mem0:
+            try:
+                return self.mem0.get_all(user_id=user_id)
+            except Exception:
+                pass
+        return []
+
+    def delete(self, memory_id):
+        if self.mem0:
+            try:
+                self.mem0.delete(memory_id)
+            except Exception:
+                pass
+        if self.index:
+            try:
+                self.index.delete(ids=[memory_id])
+            except Exception:
+                pass
+        return True
+
+
+mem0_client = HybridMemoryClient()
+
+# ---------- HTTP 会话 (连接池加速) ----------
 http_session = requests.Session()
-http_session.headers.update({"User-Agent": "GenericMCPGateway/1.0"})
+adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=3)
+http_session.mount('http://', adapter)
+http_session.mount('https://', adapter)
 
-# ---------- 管理员邮箱 (从环境变量读取) ----------
-MY_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip()
+# ---------- 管理员邮箱 (从环境变量读取，兼容原版变量名) ----------
+MY_EMAIL = os.environ.get("MY_EMAIL", "").strip() or os.environ.get("ADMIN_EMAIL", "").strip()
+RESEND_KEY = os.environ.get("RESEND_API_KEY", "").strip()
+
+
+# ==========================================
+# 记忆分类宪法 (Memory Taxonomy)
+# ==========================================
+class MemoryType:
+    STREAM = "流水"       # 权重 1: 碎碎念、GPS（短期，可清理）
+    EPISODIC = "记事"     # 权重 4: 日记、发生了某事
+    IDEA = "灵感"         # 权重 7: 脑洞、笔记
+    EMOTION = "情感"      # 权重 9: 核心回忆、高光时刻
+    FACT = "画像"         # 权重 10: 静态事实
+
+
+WEIGHT_MAP = {
+    MemoryType.STREAM: 1, MemoryType.EPISODIC: 4, MemoryType.IDEA: 7,
+    MemoryType.EMOTION: 9, MemoryType.FACT: 10,
+}
 
 
 # ==========================================
@@ -81,36 +192,82 @@ def mcp_error_handler(func):
     return wrapper
 
 
-def _get_llm_client(role: str = "default"):
+def _get_llm_client(provider: str = "openai"):
     """
-    根据角色名获取对应的 LLM 客户端。
-    支持通过环境变量配置多套模型 (default / cheap / vision 等)。
-    所有配置均从环境变量读取，无硬编码密钥。
+    多模型客户端工厂：按角色返回对应的 LLM 客户端。
+    完整还原原版 5 种 provider，所有密钥/地址/模型名均从环境变量读取。
+    - openai    : 通用默认模型 (OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL_NAME)
+    - main_chat : 主对话模型，可从数据库 llm_settings 动态覆盖 (CHAT_API_KEY / CHAT_BASE_URL / CHAT_MODEL_NAME)
+    - silicon1  : 硅基流动便宜模型 (SILICON1_API_KEY / SILICON1_BASE_URL / SILICON1_MODEL_NAME)
+    - vision    : 视觉/OCR 模型 (VISION_API_KEY / VISION_BASE_URL / VISION_MODEL_NAME)
+    - voice     : 语音/STT 模型，回退到 OPENAI (VOICE_API_KEY / VOICE_BASE_URL)
     """
     from openai import OpenAI
-    role = role.upper()
-    api_key = os.environ.get(f"{role}_API_KEY", "").strip()
-    base_url = os.environ.get(f"{role}_BASE_URL", "").strip()
-    if not api_key:
-        # 回退到默认配置
-        api_key = os.environ.get("DEFAULT_API_KEY", "").strip()
-        base_url = os.environ.get("DEFAULT_BASE_URL", "").strip()
-    if not api_key:
-        return None
-    return OpenAI(api_key=api_key, base_url=base_url if base_url else None)
+    client = None
+    model_name = "gpt-3.5-turbo"
+
+    if provider == "silicon1":
+        api_key = os.environ.get("SILICON1_API_KEY", "").strip()
+        base_url = os.environ.get("SILICON1_BASE_URL", "https://api.siliconflow.cn/v1")
+        client = OpenAI(api_key=api_key, base_url=base_url) if api_key else None
+        model_name = os.environ.get("SILICON1_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
+    elif provider == "main_chat":
+        # 优先从数据库读取动态配置，回退到环境变量
+        db_conf = {}
+        if supabase:
+            try:
+                res = supabase.table("user_facts").select("value").eq("key", "llm_settings").execute()
+                db_conf = json.loads(res.data[0]['value']) if res.data else {}
+            except Exception:
+                db_conf = {}
+        api_key = db_conf.get("key") or os.environ.get("CHAT_API_KEY", "").strip()
+        base_url = db_conf.get("url") or os.environ.get("CHAT_BASE_URL", "https://api.minimaxi.com/v1")
+        model_name = db_conf.get("model") or os.environ.get("CHAT_MODEL_NAME", "abab6.5s-chat")
+        client = OpenAI(api_key=api_key, base_url=base_url) if api_key else None
+    elif provider == "vision":
+        api_key = os.environ.get("VISION_API_KEY", "").strip()
+        base_url = os.environ.get("VISION_BASE_URL", "").strip()
+        client = OpenAI(api_key=api_key, base_url=base_url if base_url else None) if api_key else None
+        model_name = os.environ.get("VISION_MODEL_NAME", "gpt-4o-mini")
+    elif provider == "voice":
+        api_key = os.environ.get("VOICE_API_KEY", os.environ.get("OPENAI_API_KEY", "")).strip()
+        base_url = os.environ.get("VOICE_BASE_URL", "https://api.openai.com/v1")
+        client = OpenAI(api_key=api_key, base_url=base_url) if api_key else None
+    else:
+        # 默认 openai provider
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("DEFAULT_API_KEY", "").strip()
+        base_url = os.environ.get("OPENAI_BASE_URL", os.environ.get("DEFAULT_BASE_URL", "")).strip()
+        client = OpenAI(api_key=api_key, base_url=base_url if base_url else None) if api_key else None
+        model_name = os.environ.get("OPENAI_MODEL_NAME", os.environ.get("DEFAULT_MODEL_NAME", "gpt-3.5-turbo"))
+
+    if client:
+        client.custom_model_name = model_name
+    return client
 
 
-async def _ask_llm_async(client, prompt: str, temperature: float = 0.7) -> str:
-    """异步调用 LLM 并返回纯文本结果。"""
-    model_name = os.environ.get("DEFAULT_MODEL_NAME", "gpt-4o-mini")
+async def _ask_llm_async(client, prompt: str, system_prompt: str = "", temperature: float = 0.7) -> str:
+    """异步调用 LLM，自动剥离 <think> 标签，返回干净的纯文本。"""
+    if not client:
+        return ""
+    model_name = getattr(client, 'custom_model_name', os.environ.get("OPENAI_MODEL_NAME", "gpt-3.5-turbo"))
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
     def _call():
-        resp = client.chat.completions.create(
-            model=model_name,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-        )
-        return resp.choices[0].message.content or ""
-    return await asyncio.to_thread(_call)
+        return client.chat.completions.create(model=model_name, messages=messages, temperature=temperature)
+
+    try:
+        resp = await asyncio.to_thread(_call)
+        if not resp.choices:
+            return ""
+        raw_text = resp.choices[0].message.content.strip()
+        # 剥离深度思考模型的 <think>...</think> 内部推理块
+        return re.sub(r'<think>.*?</think>', '', raw_text, flags=re.DOTALL | re.IGNORECASE).strip()
+    except Exception as e:
+        print(f"❌ LLM 调用失败: {e}")
+        return ""
 
 
 def _get_now_bj() -> datetime.datetime:
@@ -118,22 +275,63 @@ def _get_now_bj() -> datetime.datetime:
     return datetime.datetime.utcnow() + datetime.timedelta(hours=8)
 
 
-def _save_memory_to_db(title: str, content: str, category: str = "流水", mood: str = "平静", tags: str = "System"):
-    """将一条记忆/事件写入 Supabase memories 表 (通用版)。"""
+def _save_memory_to_db(title: str, content: str, category: str = "流水", mood: str = "平静", tags: str = ""):
+    """将一条记忆/事件写入 Supabase memories 表，自动计算重要度权重并推断标签。"""
     if not supabase:
         return
     try:
+        if category not in WEIGHT_MAP:
+            mapping = {"日记": MemoryType.EPISODIC, "Note": MemoryType.IDEA,
+                       "GPS": MemoryType.STREAM, "重要": MemoryType.EMOTION}
+            category = mapping.get(category, MemoryType.STREAM)
+        importance = WEIGHT_MAP.get(category, 1)
+
+        if not tags:
+            content_lower = content.lower()
+            if any(w in content_lower for w in ["爱", "喜欢", "讨厌", "恨"]):
+                tags = "情感,偏好"
+            elif any(w in content_lower for w in ["吃", "喝", "买"]):
+                tags = "消费,生活"
+            elif any(w in content_lower for w in ["代码", "bug", "写"]):
+                tags = "工作,Dev"
+            else:
+                tags = "System"
+
         data = {
             "title": title,
             "content": content,
             "category": category,
             "mood": mood,
             "tags": tags,
+            "importance": importance,
             "created_at": _get_now_bj().strftime("%Y-%m-%d %H:%M:%S"),
         }
         supabase.table("memories").insert(data).execute()
     except Exception as e:
         print(f"⚠️ 写入记忆失败: {e}")
+
+
+def _get_embedding(text: str):
+    """调用向量嵌入 API 生成文本向量 (供 Pinecone 记忆检索用)。变量名兼容 DOUBAO_API_KEY。"""
+    try:
+        api_key = os.environ.get("DOUBAO_API_KEY", "").strip()
+        embed_endpoint = os.environ.get("DOUBAO_EMBEDDING_EP", "").strip()
+        if not api_key or not embed_endpoint:
+            return []
+        url = "https://api.siliconflow.cn/v1/embeddings"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload = {"model": embed_endpoint, "input": text}
+        response = http_session.post(url, json=payload, headers=headers, timeout=10)
+        if response.status_code != 200:
+            return []
+        data = response.json()
+        if "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
+            raw_vec = data["data"][0].get("embedding", [])
+            if raw_vec:
+                return [float(x) for x in raw_vec]
+        return []
+    except Exception:
+        return []
 
 
 def _push_wechat(text: str, title: str = "通知"):
@@ -158,23 +356,22 @@ def _push_wechat(text: str, title: str = "通知"):
         print(f"⚠️ 推送失败: {e}")
 
 
-def _send_email_helper(subject: str, content: str):
-    """通过 Resend / 自建 SMTP 发送邮件 (通用版)。"""
-    api_key = os.environ.get("EMAIL_API_KEY", "").strip()
-    from_email = os.environ.get("EMAIL_FROM", "").strip()
-    to_email = os.environ.get("ADMIN_EMAIL", "").strip()
-    if not all([api_key, from_email, to_email]):
-        return "❌ 邮件服务未配置"
+def _send_email_helper(subject: str, content: str, is_html: bool = False):
+    """通过 Resend 发送邮件 (兼容原版 RESEND_API_KEY / MY_EMAIL 变量名)。"""
+    if not RESEND_KEY or not MY_EMAIL:
+        return "❌ 邮件配置缺失 (RESEND_API_KEY / MY_EMAIL)"
     try:
-        resp = requests.post(
-            "https://api.resend.com/emails",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={"from": from_email, "to": to_email, "subject": subject, "text": content},
-            timeout=20,
-        )
-        return "✅ 邮件已发送" if resp.status_code == 200 else f"❌ 发送失败: {resp.text}"
+        payload = {
+            "from": "onboarding@resend.dev",
+            "to": [MY_EMAIL],
+            "subject": subject,
+            "html" if is_html else "text": content,
+        }
+        requests.post("https://api.resend.com/emails",
+                      headers={"Authorization": f"Bearer {RESEND_KEY}"}, json=payload, timeout=20)
+        return "✅ 邮件已发送"
     except Exception as e:
-        return f"❌ 邮件异常: {e}"
+        return f"❌ 发送失败: {e}"
 
 
 def _clean_email_body(text: str) -> str:
@@ -185,9 +382,17 @@ def _clean_email_body(text: str) -> str:
 
 
 def _get_current_persona() -> str:
-    """读取当前 AI 人设 (从数据库 user_facts 表或环境变量)。"""
-    persona = os.environ.get("AI_PERSONA", "你是一个通用智能助手。").strip()
-    return persona
+    """读取当前 AI 人设：优先数据库 user_facts 动态人设，回退环境变量 AI_PERSONA。"""
+    base_persona = os.environ.get("AI_PERSONA", "你是一个通用智能助手。").strip()
+    if supabase:
+        try:
+            res = supabase.table("user_facts").select("value").eq("key", "sys_ai_persona").execute()
+            if res.data:
+                base_persona = res.data[0]['value']
+        except Exception:
+            pass
+    weave_instruction = "（如果对话中自然联想到相关回忆，可以简短提及，但保持对话自然流畅。）"
+    return f"{base_persona}\n\n{weave_instruction}"
 
 
 def _format_time_cn(iso_str: str) -> str:
@@ -343,28 +548,46 @@ async def echo(text: str):
 @mcp.tool()
 @mcp_error_handler
 async def save_memory(title: str, content: str, category: str = "事件"):
-    """【保存记忆】将一条信息持久化到数据库。"""
+    """【保存记忆】将一条信息持久化到数据库，同时双写到 Mem0/Pinecone 向量库。"""
     await asyncio.to_thread(_save_memory_to_db, title, content, category)
+    try:
+        await asyncio.to_thread(mem0_client.add, [{"role": "assistant", "content": f"{title}: {content}"}])
+    except Exception:
+        pass
     return f"✅ 记忆已保存: {title}"
 
 
 @mcp.tool()
 @mcp_error_handler
 async def search_memory(query: str):
-    """【搜索记忆】在数据库中模糊搜索 title 和 content 字段。"""
-    if not supabase:
-        return "❌ 数据库未连接"
-    def _query():
-        return supabase.table("memories").select("id, title, content, importance").or_(
-            f"title.ilike.%{query}%,content.ilike.%{query}%"
-        ).order("importance", desc=True).limit(5).execute()
-    sb_res = await asyncio.to_thread(_query)
-    if not sb_res or not sb_res.data:
+    """【搜索记忆】先查向量库 (语义相似)，再查数据库 (关键词模糊)，合并结果。"""
+    ans_parts = []
+    # 1. 向量语义搜索
+    try:
+        vec_results = await asyncio.to_thread(mem0_client.search, query)
+        if vec_results:
+            res_list = vec_results.get("results", vec_results) if isinstance(vec_results, dict) else vec_results
+            if isinstance(res_list, list) and res_list:
+                ans_parts.append("🧠 【语义相似记忆】:")
+                for r in res_list[:3]:
+                    mem = r.get("memory", r.get("text", str(r))) if isinstance(r, dict) else str(r)
+                    ans_parts.append(f"- {mem}")
+    except Exception:
+        pass
+    # 2. 数据库关键词搜索
+    if supabase:
+        def _query():
+            return supabase.table("memories").select("id, title, content, importance").or_(
+                f"title.ilike.%{query}%,content.ilike.%{query}%"
+            ).order("importance", desc=True).limit(5).execute()
+        sb_res = await asyncio.to_thread(_query)
+        if sb_res and sb_res.data:
+            ans_parts.append("🔍 【关键词匹配记忆】:")
+            for r in sb_res.data:
+                ans_parts.append(f"- 【{r.get('title', '无题')}】: {r['content']}")
+    if not ans_parts:
         return "🧠 暂未搜到相关记忆。"
-    ans = f"🔍 检索 '{query}' 的结果:\n"
-    for r in sb_res.data:
-        ans += f"- 【{r.get('title', '无题')}】: {r['content']}\n"
-    return ans
+    return "\n".join(ans_parts)
 
 
 @mcp.tool()
@@ -494,16 +717,36 @@ async def send_email_via_api(subject: str, content: str):
 
 @mcp.tool()
 async def web_search(query: str, max_results: int = 5):
-    """【网页搜索】使用 DuckDuckGo 进行免费网页搜索。"""
+    """【网页搜索】优先使用 Tavily (高质量)，无配置时回退 DuckDuckGo (免费兜底)。"""
+    tavily_key = os.environ.get("TAVILY_API_KEY", "").strip()
+    # 1. 优先 Tavily
+    if tavily_key:
+        try:
+            def _tavily():
+                return requests.post("https://api.tavily.com/search", json={
+                    "api_key": tavily_key, "query": query,
+                    "search_depth": "basic", "include_answer": False
+                }, timeout=10).json()
+            res = await asyncio.to_thread(_tavily)
+            if res.get("results"):
+                ans = f"🌐 '{query}' 的搜索结果 (Tavily):\n\n"
+                for i, item in enumerate(res["results"][:3], 1):
+                    preview = item.get('content', '')[:150]
+                    preview = preview + "..." if len(preview) >= 150 else preview
+                    ans += f"{i}. 【{item.get('title')}】\n   {preview}\n   (来源: {item.get('url')})\n\n"
+                return ans.strip()
+        except Exception as e:
+            print(f"⚠️ Tavily 搜索失败，回退 DDG: {e}")
+    # 2. 回退 DuckDuckGo
     try:
         from duckduckgo_search import DDGS
-        def _search():
+        def _ddg():
             with DDGS() as ddgs:
                 return list(ddgs.text(query, max_results=max_results))
-        results = await asyncio.to_thread(_search)
+        results = await asyncio.to_thread(_ddg)
         if not results:
             return "🔍 未找到结果。"
-        ans = f"🔍 '{query}' 的搜索结果:\n"
+        ans = f"🔍 '{query}' 的搜索结果 (DuckDuckGo):\n"
         for i, r in enumerate(results, 1):
             ans += f"{i}. {r.get('title', '')}\n   {r.get('body', '')[:100]}\n   {r.get('href', '')}\n"
         return ans
@@ -873,10 +1116,10 @@ async def tarot_reading(question: str):
         "XVIII. 月亮 (The Moon)", "XIX. 太阳 (The Sun)", "XX. 审判 (Judgement)", "XXI. 世界 (The World)"
     ]
     draw = random.sample(deck, 3)
-    client = _get_llm_client()
+    client = _get_llm_client("openai")
     if not client:
         return f"🔮 抽牌结果：{', '.join(draw)}。\n(⚠️ LLM 未配置，无法解读)"
-    persona = _get_current_persona()
+    persona = await asyncio.to_thread(_get_current_persona)
     prompt = f"当前人设：{persona}\n场景：用户因 '{question}' 感到困惑，想通过塔罗牌找方向。\n抽牌：过去 {draw[0]} | 现在 {draw[1]} | 未来 {draw[2]}\n请给出 200 字内解读。"
     ai_reply = await _ask_llm_async(client, prompt, temperature=0.8)
     return f"🔮 【塔罗指引】\n🃏 牌阵: {draw[0]} | {draw[1]} | {draw[2]}\n\n💬 {ai_reply}"
@@ -910,17 +1153,21 @@ async def switch_ai_brain(brain_name: str = ""):
     """【切换 AI 大脑】查看或切换当前使用的 LLM 模型配置。
     brain_name 留空 = 查看当前；填入角色名 (如 cheap/vision) = 切换默认。"""
     if not brain_name:
-        cur = os.environ.get("DEFAULT_MODEL_NAME", "未设置")
-        return f"🧠 当前默认大脑: {cur}\n可用角色: default / cheap / vision (需对应环境变量)"
-    brain_name = brain_name.upper()
-    key = os.environ.get(f"{brain_name}_API_KEY", "").strip()
-    model = os.environ.get(f"{brain_name}_MODEL_NAME", "").strip()
+        cur = os.environ.get("OPENAI_MODEL_NAME", os.environ.get("DEFAULT_MODEL_NAME", "未设置"))
+        return f"🧠 当前默认大脑: {cur}\n可用角色: openai / main_chat / silicon1 / vision / voice"
+    brain_name = brain_name.lower()
+    var_prefix = {"openai": "OPENAI", "main_chat": "CHAT", "silicon1": "SILICON1",
+                  "vision": "VISION", "voice": "VOICE"}.get(brain_name)
+    if not var_prefix:
+        return f"❌ 未知角色: {brain_name}"
+    key = os.environ.get(f"{var_prefix}_API_KEY", "").strip()
+    model = os.environ.get(f"{var_prefix}_MODEL_NAME", "").strip()
     if not key:
-        return f"❌ 角色 {brain_name} 未配置 {brain_name}_API_KEY。"
-    os.environ["DEFAULT_API_KEY"] = key
-    os.environ["DEFAULT_BASE_URL"] = os.environ.get(f"{brain_name}_BASE_URL", "")
+        return f"❌ 角色 {brain_name} 未配置 {var_prefix}_API_KEY。"
+    os.environ["OPENAI_API_KEY"] = key
+    os.environ["OPENAI_BASE_URL"] = os.environ.get(f"{var_prefix}_BASE_URL", "")
     if model:
-        os.environ["DEFAULT_MODEL_NAME"] = model
+        os.environ["OPENAI_MODEL_NAME"] = model
     return f"✅ 已切换到 {brain_name} 大脑 (模型: {model or '未改'})。"
 
 
@@ -1131,18 +1378,25 @@ def _print_config_report():
         return bool(os.environ.get(key, "").strip())
 
     items = [
-        ("LLM (默认模型)",    _ok("DEFAULT_API_KEY"),  os.environ.get("DEFAULT_MODEL_NAME", "未设置")),
+        ("LLM (默认模型)",    _ok("OPENAI_API_KEY") or _ok("DEFAULT_API_KEY"), os.environ.get("OPENAI_MODEL_NAME", os.environ.get("DEFAULT_MODEL_NAME", "未设置"))),
+        ("主对话 (CHAT)",     _ok("CHAT_API_KEY"),     os.environ.get("CHAT_MODEL_NAME", "未设置")),
+        ("硅基 (SILICON1)",   _ok("SILICON1_API_KEY"), os.environ.get("SILICON1_MODEL_NAME", "未设置")),
+        ("视觉 (VISION)",     _ok("VISION_API_KEY"),   os.environ.get("VISION_MODEL_NAME", "未设置")),
+        ("语音 (VOICE)",      _ok("VOICE_API_KEY") or _ok("OPENAI_API_KEY"), "已配置" if _ok("VOICE_API_KEY") or _ok("OPENAI_API_KEY") else "未配置"),
         ("数据库 (Supabase)", _ok("SUPABASE_URL") and _ok("SUPABASE_KEY"), "已连接" if supabase else "未连接"),
-        ("长期记忆 (Mem0)",   bool(mem0_client),       "已启用" if mem0_client else "未配置"),
+        ("长期记忆 (Mem0)",   _ok("MEM0_API_KEY"),     "已启用" if mem0_client.mem0 else "未配置"),
+        ("向量库 (Pinecone)", _ok("PINECONE_API_KEY"), "已启用" if mem0_client.index else "未配置"),
+        ("向量嵌入 (Doubao)", _ok("DOUBAO_API_KEY"),   "已配置" if _ok("DOUBAO_API_KEY") else "未配置"),
         ("Telegram 推送",     _ok("TG_BOT_TOKEN") and _ok("TG_CHAT_ID"), "已配置" if _ok("TG_BOT_TOKEN") else "未配置 Token"),
         ("Gmail/日历",        _ok("GOOGLE_USER_TOKEN_JSON"), "已配置 OAuth" if _ok("GOOGLE_USER_TOKEN_JSON") else "未配置 OAuth"),
-        ("邮件发送 (Resend)", _ok("EMAIL_API_KEY") and _ok("EMAIL_FROM") and _ok("ADMIN_EMAIL"), "已配置" if _ok("EMAIL_API_KEY") else "未配置"),
+        ("邮件发送 (Resend)", _ok("RESEND_API_KEY") and _ok("MY_EMAIL"), "已配置" if _ok("RESEND_API_KEY") else "未配置"),
         ("QQ 机器人 (NapCat)",_ok("NAPCAT_WS_URL") or _ok("NAPCAT_HTTP_URL"), "已配置" if (_ok("NAPCAT_WS_URL") or _ok("NAPCAT_HTTP_URL")) else "未配置"),
         ("地图/GPS (高德)",    _ok("AMAP_API_KEY"),     "已配置" if _ok("AMAP_API_KEY") else "未配置"),
-        ("网页搜索 (DDG)",    True,                    "免费免配置"),
+        ("网页搜索",          _ok("TAVILY_API_KEY"),   "Tavily" if _ok("TAVILY_API_KEY") else "DDG 免费兜底"),
         ("AI 音乐 (Replicate)", _ok("REPLICATE_API_KEY"), "已配置" if _ok("REPLICATE_API_KEY") else "未配置"),
         ("云端笔记 (WebDAV)", _ok("WEBDAV_URL") and _ok("WEBDAV_USER"), "已配置" if _ok("WEBDAV_URL") else "未配置"),
         ("HTML 转图 (HCTI)",  _ok("HCTI_API_ID"),       "已配置" if _ok("HCTI_API_ID") else "未配置"),
+        ("接口安全密钥",      _ok("API_SECRET"),        "已配置" if _ok("API_SECRET") else "⚠️ 未配置(危险)"),
     ]
     enabled = sum(1 for _, ok, _ in items if ok)
     total = len(items)

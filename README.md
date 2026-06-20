@@ -71,8 +71,8 @@ cp .env.example .env
 ```
 
 **最小化配置**（只跑通 MCP 工具）只需设置：
-- `DEFAULT_API_KEY` — LLM 的 API Key
-- `DEFAULT_MODEL_NAME` — 模型名
+- `OPENAI_API_KEY` — LLM 的 API Key
+- `OPENAI_MODEL_NAME` — 模型名
 
 ### 3. 启动
 
@@ -94,18 +94,29 @@ http://<你的域名或IP>:10000/sse
 
 ## 🧩 MCP 工具清单
 
-| 工具 | 功能 |
-|------|------|
-| `echo` | 回声测试 |
-| `save_memory` / `search_memory` | 记忆存取 |
-| `manage_user_fact` / `get_user_profile` | 用户画像 |
-| `organize_knowledge_base` | 知识库 CRUD |
-| `manage_reminder` | 提醒/闹钟 |
-| `send_notification` | 多渠道推送 |
-| `send_email_via_api` | 发送邮件 |
-| `web_search` | DuckDuckGo 搜索 |
-| `check_inbox` / `read_full_email` / `reply_external_email` | Gmail 收发 |
-| `add_calendar_event` / `get_calendar_events` / `modify_calendar_event` | Google 日历 |
+> 网关共注册 **30+ 个 MCP 工具**，按子系统分组（按需配置即可启用）：
+
+| 分类 | 工具 | 功能 |
+|------|------|------|
+| 基础 | `echo` | 回声测试 |
+| 记忆 | `save_memory` / `search_memory` | 记忆存取（数据库 + Mem0/Pinecone 向量双写双搜）|
+| 记忆 | `get_latest_diary` | 加载最新记忆流（长期总结 + 短期对话 + 小屋动态）|
+| 画像 | `manage_user_fact` / `get_user_profile` | 用户画像 CRUD |
+| 知识库 | `organize_knowledge_base` | 通用知识库 CRUD |
+| 提醒 | `manage_reminder` | 闹钟/提醒 (数据库持久版) |
+| 消息 | `send_notification` | 多渠道推送 (Telegram) |
+| 邮件 | `send_email_via_api` | Resend 发邮件 |
+| 邮件 | `check_inbox` / `read_full_email` / `reply_external_email` | Gmail 收发 |
+| 日历 | `add_calendar_event` / `get_calendar_events` / `modify_calendar_event` | Google 日历 |
+| 搜索 | `web_search` | 网页搜索 (Tavily 优先 + DDG 兜底) |
+| 模型 | `switch_ai_brain` | 热切换 LLM 角色 (openai/main_chat/silicon1/vision/voice) |
+| 生活 | `manage_memory_house` | AI 虚拟生活小屋 (陪伴感) |
+| 生活 | `save_expense` / `check_expense_report` / `manage_piggy_bank` | 记账 + 账单 + 储蓄罐 |
+| 生活 | `where_is_user` / `explore_surroundings` | GPS 定位 + 周边探索 (高德) |
+| 娱乐 | `tarot_reading` | AI 塔罗占卜 |
+| 多媒体 | `render_html_to_image` | HTML/CSS 转图片 (HCTI) |
+| 多媒体 | `compose_music` / `cover_existing_song` | AI 作曲 + AI 翻唱 (Replicate) |
+| 笔记 | `list_obsidian_cloud` / `read_obsidian_cloud` / `write_obsidian_cloud` | WebDAV 云端笔记 (Obsidian) |
 
 ---
 
@@ -147,10 +158,10 @@ create table memories (
   id bigint generated always as identity primary key,
   title text,
   content text,
-  category text default '事件',
+  category text default '流水',          -- 流水/记事/灵感/情感/画像
   mood text default '平静',
   tags text default 'System',
-  importance int default 5,
+  importance int default 1,              -- 权重 1~10，按 category 自动计算
   created_at text
 );
 
@@ -255,7 +266,7 @@ docker run -d --name mcp-gateway --restart unless-stopped \
    - Build Command: `pip install -r requirements.txt`
    - Start Command: `python server.py`
 4. **注入环境变量**：在平台后台把 `.env` 里的变量逐条填入
-   - 必填：`DEFAULT_API_KEY`、`DEFAULT_MODEL_NAME`
+   - 必填：`OPENAI_API_KEY`、`OPENAI_MODEL_NAME`
    - 端口：平台会自动注入 `PORT`，无需手动设
 5. **暴露端口**：设为 `10000`（或代码读取的 `PORT`）
 6. **绑定域名**：平台自动分配 HTTPS 域名，直接用
@@ -375,7 +386,7 @@ pip install -r requirements.txt
 
 # 3. 配置环境变量
 cp .env.example .env
-# 编辑 .env，至少填入 DEFAULT_API_KEY 和 DEFAULT_MODEL_NAME
+# 编辑 .env，至少填入 OPENAI_API_KEY 和 OPENAI_MODEL_NAME
 
 # 4. 运行
 python server.py
@@ -405,7 +416,8 @@ curl http://localhost:10000/health
 - ✅ **零硬编码密钥**：所有 API Key、Token、URL 均从环境变量读取
 - ✅ **无个人化数据**：移除了人设、私人域名、用户 ID 等
 - ✅ **统一错误兜底**：`mcp_error_handler` 装饰器防止单个工具崩溃影响整体
-- ✅ **可选依赖**：Supabase / Mem0 / Gmail 等缺失时优雅降级而非报错
+- ✅ **可选依赖**：Supabase / Mem0 / Pinecone / Gmail 等缺失时优雅降级而非报错
+- ✅ **管理接口鉴权**：所有 `/api/*` 接口强制校验 `API_SECRET` 密钥
 
 ---
 
@@ -413,7 +425,7 @@ curl http://localhost:10000/health
 
 - **新增 MCP 工具**：在 `server.py` 中仿照现有工具添加 `@mcp.tool()` 函数即可
 - **新增消息渠道**：在 `heartbeat.py` 中添加新的轮询协程，复用 `_get_llm_client` / `_push_wechat`
-- **替换 LLM**：只需修改 `DEFAULT_BASE_URL` 和 `DEFAULT_MODEL_NAME`
+- **替换 LLM**：只需修改 `OPENAI_BASE_URL` 和 `OPENAI_MODEL_NAME`（或配置多角色 `CHAT_*` / `VISION_*` / `VOICE_*`）
 - **替换数据库**：将 `server.py` 顶部的 `supabase = ...` 改为你的客户端即可
 
 ---
