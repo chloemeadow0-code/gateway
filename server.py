@@ -952,41 +952,8 @@ async def modify_calendar_event(event_id: str, action: str, new_summary: str = "
 
 
 # ==========================================
-# GPS / 周边探索 / 记忆小屋 / 生活工具
+# GPS / 记忆小屋 / 生活工具
 # ==========================================
-
-@mcp.tool()
-@mcp_error_handler
-async def explore_surroundings(query: str = "便利店"):
-    """【周边探索】基于用户最新位置搜索附近设施 (高德地图)。需配置 AMAP_API_KEY。"""
-    amap_key = os.environ.get("AMAP_API_KEY", "").strip()
-    if not amap_key:
-        return "❌ 未配置 AMAP_API_KEY (高德地图 Web 服务 Key)。"
-    data = await asyncio.to_thread(_get_latest_gps_record)
-    if not data:
-        return "📍 暂无位置记录，无法探索周边。"
-    lat, lon = data.get("location_latitude") or data.get("lat"), data.get("location_longitude") or data.get("lon")
-    if not lat or not lon:
-        return "📍 最新记录尚无精确坐标。"
-    try:
-        lat_f, lon_f = float(lat), float(lon)
-        if lat_f > 80:
-            lat_f, lon_f = lon_f, lat_f
-        url = f"https://restapi.amap.com/v3/place/around?key={amap_key}&location={lon_f},{lat_f}&keywords={query}&radius=3000&offset=5&page=1&extensions=base"
-        res = await asyncio.to_thread(lambda: requests.get(url, timeout=5).json())
-        if res.get("status") != "1" or not res.get("pois"):
-            return f"🗺️ 附近 3 公里内未找到与 '{query}' 相关的设施。"
-        ans = f"🗺️ 基于当前坐标搜到的【{query}】:\n"
-        for i, item in enumerate(res["pois"][:3], 1):
-            name = item.get('name', '未知地点')
-            address = item.get('address', '无详细地址')
-            distance = item.get('distance', '未知')
-            dist_str = f"约 {distance} 米" if str(distance).isdigit() else "就在附近"
-            ans += f"{i}. 📍 {name} ({dist_str})\n   └─ 地址: {address}\n"
-        return ans
-    except Exception as e:
-        return f"❌ 周边探索失败: {e}"
-
 
 @mcp.tool()
 @mcp_error_handler
@@ -1145,30 +1112,6 @@ async def render_html_to_image(html_content: str, css_content: str = ""):
         return ""
     img_url = await asyncio.to_thread(_render)
     return f"![渲染图片]({img_url})" if img_url else "❌ 图片渲染失败。"
-
-
-@mcp.tool()
-@mcp_error_handler
-async def switch_ai_brain(brain_name: str = ""):
-    """【切换 AI 大脑】查看或切换当前使用的 LLM 模型配置。
-    brain_name 留空 = 查看当前；填入角色名 (如 cheap/vision) = 切换默认。"""
-    if not brain_name:
-        cur = os.environ.get("OPENAI_MODEL_NAME", os.environ.get("DEFAULT_MODEL_NAME", "未设置"))
-        return f"🧠 当前默认大脑: {cur}\n可用角色: openai / main_chat / silicon1 / vision / voice"
-    brain_name = brain_name.lower()
-    var_prefix = {"openai": "OPENAI", "main_chat": "CHAT", "silicon1": "SILICON1",
-                  "vision": "VISION", "voice": "VOICE"}.get(brain_name)
-    if not var_prefix:
-        return f"❌ 未知角色: {brain_name}"
-    key = os.environ.get(f"{var_prefix}_API_KEY", "").strip()
-    model = os.environ.get(f"{var_prefix}_MODEL_NAME", "").strip()
-    if not key:
-        return f"❌ 角色 {brain_name} 未配置 {var_prefix}_API_KEY。"
-    os.environ["OPENAI_API_KEY"] = key
-    os.environ["OPENAI_BASE_URL"] = os.environ.get(f"{var_prefix}_BASE_URL", "")
-    if model:
-        os.environ["OPENAI_MODEL_NAME"] = model
-    return f"✅ 已切换到 {brain_name} 大脑 (模型: {model or '未改'})。"
 
 
 # ==========================================
